@@ -9,78 +9,96 @@ from io import BytesIO
 st.set_page_config(page_title="NIFTY50 Backtest (CPR + SMA + Price Action)", layout="wide")
 
 # =========================================================
-# Robust Yahoo Finance fetcher (NO KeyError on 'timestamp')
+# Fixed Yahoo Finance fetcher
 # =========================================================
 def fetch_market_data(symbol: str, period: str = "6mo", interval: str = "1h") -> pd.DataFrame:
     """
-    Safely fetch OHLCV from Yahoo Finance and ALWAYS return:
-    ['timestamp','open','high','low','close','volume'].
-
-    - Handles 'Date' vs 'Datetime' vs missing timestamp column
-    - Converts UTC -> Asia/Kolkata (IST) and strips timezone (naive)
-    - Returns empty DataFrame if no data / error
+    Safely fetch OHLCV from Yahoo Finance and return standardized DataFrame.
     """
     try:
         df = yf.download(symbol, period=period, interval=interval, auto_adjust=True, progress=False)
     except Exception as e:
-        # In Streamlit, show the error and return empty frame
         st.error(f"⚠️ yfinance error: {e}")
         return pd.DataFrame()
 
     if df is None or df.empty:
+        st.warning(f"No data found for {symbol}")
         return pd.DataFrame()
 
-    # yfinance returns a Date/Datetime index; make it a column
+    # Reset index to make Date/Datetime a column
     df = df.reset_index()
-
-    # Detect time column safely
+    
+    # Find the timestamp column
     time_col = None
     for col in df.columns:
-        if str(col).lower() in ("datetime", "date", "timestamp"):
+        if str(col).lower() in ("datetime", "date"):
             time_col = col
             break
-
+    
     if time_col:
-        df.rename(columns={time_col: "timestamp"}, inplace=True)
+        df = df.rename(columns={time_col: "timestamp"})
     else:
-        # fallback: use the (now) integer index, try to parse—may be NaT (handled below)
+        # If no timestamp column found, create one from index
         df["timestamp"] = pd.to_datetime(df.index, errors="coerce")
 
-    # Standardize OHLCV
-    df.rename(
-        columns={
-            "Open": "open", "High": "high", "Low": "low",
-            "Close": "close", "Adj Close": "close", "Volume": "volume"
-        },
-        inplace=True,
-    )
+    # Standardize column names - FIXED: Handle different column naming conventions
+    column_mapping = {}
+    for col in df.columns:
+        col_lower = str(col).lower()
+        if col_lower == "open":
+            column_mapping[col] = "open"
+        elif col_lower == "high":
+            column_mapping[col] = "high"
+        elif col_lower == "low":
+            column_mapping[col] = "low"
+        elif col_lower in ["close", "adj close"]:
+            column_mapping[col] = "close"
+        elif col_lower == "volume":
+            column_mapping[col] = "volume"
+    
+    df = df.rename(columns=column_mapping)
 
-    # Parse timestamps, convert to IST, then strip tz to avoid Streamlit date comparison issues
-    df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce", utc=True)
-    df = df[df["timestamp"].notna()]  # safe filter; 'timestamp' exists for sure
+    # Ensure timestamp is properly formatted
+    df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
+    df = df[df["timestamp"].notna()]
+    
     if df.empty:
-        return pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume"])
+        return pd.DataFrame()
 
+    # Convert to IST and make timezone-naive
     try:
-        df["timestamp"] = df["timestamp"].dt.tz_convert("Asia/Kolkata").dt.tz_localize(None)
+        if df["timestamp"].dt.tz is not None:
+            df["timestamp"] = df["timestamp"].dt.tz_convert("Asia/Kolkata").dt.tz_localize(None)
+        else:
+            # Assume UTC if no timezone, convert to IST
+            df["timestamp"] = pd.to_datetime(df["timestamp"]).dt.tz_localize('UTC').dt.tz_convert('Asia/Kolkata').dt.tz_localize(None)
     except Exception:
-        # If already naive, ensure it's datetime
-        df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
-        df = df[df["timestamp"].notna()]
+        # If timezone conversion fails, proceed without it
+        df["timestamp"] = pd.to_datetime(df["timestamp"])
 
-    # Ensure required columns exist and are numeric
-    for c in ["open", "high", "low", "close", "volume"]:
-        if c not in df.columns:
-            df[c] = np.nan
-        df[c] = pd.to_numeric(df[c], errors="coerce")
+    # Ensure required columns exist
+    required_columns = ["open", "high", "low", "close", "volume"]
+    for col in required_columns:
+        if col not in df.columns:
+            df[col] = np.nan
 
-    df = df[["timestamp", "open", "high", "low", "close", "volume"]]
+    # Convert numeric columns safely - FIXED: Check if column exists before conversion
+    numeric_columns = ["open", "high", "low", "close", "volume"]
+    for col in numeric_columns:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    # Select and reorder columns
+    final_columns = ["timestamp"] + numeric_columns
+    df = df[final_columns]
+    
+    # Drop rows where essential price data is missing
     df = df.dropna(subset=["open", "high", "low", "close"]).reset_index(drop=True)
+    
     return df
 
-
 # =======================================
-# Indicators & helper functions (your logic)
+# Indicators & helper functions (unchanged)
 # =======================================
 def calculate_sma(data: pd.DataFrame, period: int):
     return data["close"].rolling(window=period).mean()
@@ -139,13 +157,12 @@ def check_sell_signal(data: pd.DataFrame, i: int):
                 return True
     return False
 
-
 # ============================
 # Core backtest / strategy
 # ============================
 def run_strategy(data: pd.DataFrame) -> pd.DataFrame:
     """
-    Input: DataFrame with ['timestamp','open','high','low','close','volume'] (timestamp can be column).
+    Input: DataFrame with ['timestamp','open','high','low','close','volume']
     Output: Adds SMA/CPR, signals, positions, equity, PnL, drawdown.
     """
     df = data.copy().reset_index(drop=True)
@@ -252,7 +269,6 @@ def run_strategy(data: pd.DataFrame) -> pd.DataFrame:
 
     return df
 
-
 # ============================
 # Streamlit Dashboard
 # ============================
@@ -260,7 +276,7 @@ def create_dashboard():
     st.title("📈 NIFTY 50 Backtest — CPR + SMA + Price Action")
     st.caption("Pick a stock, timeframe, and dates. Click **Run Backtest** to simulate.")
 
-    # NIFTY 50 symbols (expand as needed)
+    # NIFTY 50 symbols
     nifty_50 = {
         "RELIANCE": "RELIANCE.NS", "TCS": "TCS.NS", "INFY": "INFY.NS", "HDFCBANK": "HDFCBANK.NS",
         "ICICIBANK": "ICICIBANK.NS", "SBIN": "SBIN.NS", "ITC": "ITC.NS", "KOTAKBANK": "KOTAKBANK.NS",
@@ -345,9 +361,9 @@ def create_dashboard():
         buys = result[result["signal"] == 1]
         sells = result[result["signal"] == -1]
         if not buys.empty:
-            ax2.scatter(buys["timestamp"], buys["close"], marker="^", s=70, label="Buy", zorder=5)
+            ax2.scatter(buys["timestamp"], buys["close"], marker="^", s=70, color="green", label="Buy", zorder=5)
         if not sells.empty:
-            ax2.scatter(sells["timestamp"], sells["close"], marker="v", s=70, label="Sell", zorder=5)
+            ax2.scatter(sells["timestamp"], sells["close"], marker="v", s=70, color="red", label="Sell", zorder=5)
         ax2.set_title("Price with Buy/Sell Signals")
         ax2.legend()
         ax2.grid(alpha=0.3)
@@ -356,10 +372,18 @@ def create_dashboard():
         # ---- Tables
         entries = result.loc[result["signal"] != 0, ["timestamp", "signal", "entry_price", "position", "sma_20"]]
         exits = result.loc[result["pnl"] != 0, ["timestamp", "exit_price", "pnl", "position"]]
+        
         with st.expander("View entry signals"):
-            st.dataframe(entries.sort_values("timestamp").reset_index(drop=True), height=260)
+            if not entries.empty:
+                st.dataframe(entries.sort_values("timestamp").reset_index(drop=True), height=260)
+            else:
+                st.info("No entry signals generated during this period")
+
         with st.expander("View exits / trade P&L"):
-            st.dataframe(exits.sort_values("timestamp").reset_index(drop=True), height=260)
+            if not exits.empty:
+                st.dataframe(exits.sort_values("timestamp").reset_index(drop=True), height=260)
+            else:
+                st.info("No trade exits during this period")
 
         # ---- Downloads
         full_csv_buf = BytesIO()
@@ -372,16 +396,18 @@ def create_dashboard():
             mime="text/csv",
         )
 
-        trades_summary = pd.concat(
-            [entries.reset_index(drop=True), exits.reset_index(drop=True)],
-            axis=1
-        )
-        st.download_button(
-            "⬇ Download trades summary CSV",
-            data=trades_summary.to_csv(index=False),
-            file_name=f"{symbol}_trades_summary.csv",
-            mime="text/csv",
-        )
+        # Create trades summary
+        if not entries.empty and not exits.empty:
+            trades_summary = pd.concat(
+                [entries.reset_index(drop=True), exits.reset_index(drop=True)],
+                axis=1
+            )
+            st.download_button(
+                "⬇ Download trades summary CSV",
+                data=trades_summary.to_csv(index=False),
+                file_name=f"{symbol}_trades_summary.csv",
+                mime="text/csv",
+            )
 
 
 if __name__ == "__main__":
