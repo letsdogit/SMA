@@ -159,7 +159,9 @@ def run_strategy(df_daily: pd.DataFrame, leverage: int = 10, commission_rate: fl
         df.at[i, 'drawdown'] = drawdown
 
         # Entry rules (daily CPR + SMA+ pattern)
-        if position is None and bool(df.at[i, 'narrow_cpr']):
+        # Safe check for narrow_cpr
+        narrow_flag = bool(df.at[i, 'narrow_cpr']) if 'narrow_cpr' in df.columns and not pd.isna(df.at[i, 'narrow_cpr']) else False
+        if position is None and narrow_flag:
             if is_near_sma(current['Close'], df.at[i, 'sma_20']):
                 if i >= 6 and is_sma_rising(df.at[i, 'sma_20'], df.at[i - 6, 'sma_20']) and check_buy_signal(df, i):
                     df.at[i, 'signal'] = 1
@@ -302,3 +304,4 @@ st.write('Notes:')
 st.write('- CPR is computed only on daily data using \*previous day\* OHLC. For intraday CPR mapping, we can extend this.')
 st.write('- Commission is per side (entry and exit both charged).')
 st.write('- If you need more Nifty tickers added, tell me and I will expand the list.')
+
