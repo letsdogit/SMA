@@ -9,7 +9,7 @@ from io import BytesIO
 st.set_page_config(page_title="NIFTY50 Backtest (CPR + SMA + Price Action)", layout="wide")
 
 # =========================================================
-# Fixed Yahoo Finance fetcher
+# Fixed Yahoo Finance fetcher - Robust column handling
 # =========================================================
 def fetch_market_data(symbol: str, period: str = "6mo", interval: str = "1h") -> pd.DataFrame:
     """
@@ -41,21 +41,25 @@ def fetch_market_data(symbol: str, period: str = "6mo", interval: str = "1h") ->
         # If no timestamp column found, create one from index
         df["timestamp"] = pd.to_datetime(df.index, errors="coerce")
 
-    # Standardize column names - FIXED: Handle different column naming conventions
+    # Debug: Show available columns
+    st.sidebar.write(f"Available columns: {list(df.columns)}")
+    
+    # Standardize column names - Handle different cases and naming conventions
     column_mapping = {}
     for col in df.columns:
-        col_lower = str(col).lower()
-        if col_lower == "open":
+        col_str = str(col).lower()
+        if col_str == "open":
             column_mapping[col] = "open"
-        elif col_lower == "high":
+        elif col_str == "high":
             column_mapping[col] = "high"
-        elif col_lower == "low":
+        elif col_str == "low":
             column_mapping[col] = "low"
-        elif col_lower in ["close", "adj close"]:
+        elif col_str in ["close", "adj close"]:
             column_mapping[col] = "close"
-        elif col_lower == "volume":
+        elif col_str == "volume":
             column_mapping[col] = "volume"
     
+    # Apply renaming
     df = df.rename(columns=column_mapping)
 
     # Ensure timestamp is properly formatted
@@ -76,29 +80,46 @@ def fetch_market_data(symbol: str, period: str = "6mo", interval: str = "1h") ->
         # If timezone conversion fails, proceed without it
         df["timestamp"] = pd.to_datetime(df["timestamp"])
 
-    # Ensure required columns exist
+    # Ensure required columns exist - create them if missing
     required_columns = ["open", "high", "low", "close", "volume"]
     for col in required_columns:
         if col not in df.columns:
             df[col] = np.nan
+            st.warning(f"Created missing column: {col}")
 
-    # Convert numeric columns safely - FIXED: Check if column exists before conversion
+    # Convert numeric columns safely
     numeric_columns = ["open", "high", "low", "close", "volume"]
     for col in numeric_columns:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
 
-    # Select and reorder columns
-    final_columns = ["timestamp"] + numeric_columns
-    df = df[final_columns]
+    # Select and reorder columns - only include columns that exist
+    available_columns = ["timestamp"]
+    for col in numeric_columns:
+        if col in df.columns:
+            available_columns.append(col)
+    
+    df = df[available_columns]
+    
+    # Check if we have the minimum required price data
+    price_columns = ["open", "high", "low", "close"]
+    has_required_data = all(col in df.columns for col in price_columns)
+    
+    if not has_required_data:
+        st.error(f"Missing required price columns. Available: {list(df.columns)}")
+        return pd.DataFrame()
     
     # Drop rows where essential price data is missing
-    df = df.dropna(subset=["open", "high", "low", "close"]).reset_index(drop=True)
+    df = df.dropna(subset=price_columns).reset_index(drop=True)
+    
+    if df.empty:
+        st.warning("No data remaining after cleaning")
+        return pd.DataFrame()
     
     return df
 
 # =======================================
-# Indicators & helper functions (unchanged)
+# Indicators & helper functions 
 # =======================================
 def calculate_sma(data: pd.DataFrame, period: int):
     return data["close"].rolling(window=period).mean()
@@ -313,6 +334,13 @@ def create_dashboard():
         if raw.empty:
             st.error("No data fetched. Try changing Period/Interval (note: intraday has limited history).")
             return
+
+        st.success(f"✅ Successfully fetched {len(raw)} data points")
+        
+        # Show data preview
+        with st.expander("View raw data preview"):
+            st.dataframe(raw.head())
+            st.write(f"Columns: {list(raw.columns)}")
 
         # Date filter (both sides naive IST)
         df = raw.copy()
