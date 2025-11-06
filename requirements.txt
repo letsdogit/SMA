@@ -5,3 +5,4 @@ yfinance
 backtesting
 pandas-ta
 plotly
+lxml
