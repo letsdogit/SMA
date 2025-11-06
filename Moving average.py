@@ -2,428 +2,667 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import yfinance as yf
-import pandas_ta as ta
 import plotly.graph_objects as go
-from backtesting import Backtest, Strategy
+from plotly.subplots import make_subplots
+import warnings
 from datetime import datetime, timedelta
-from typing import Union
+import requests
+from io import StringIO
+import ta
 
-# --- Page Configuration ---
-st.set_page_config(
-    page_title="Nifty50 Quant Backtester",
-    page_icon="📈",
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
+warnings.filterwarnings('ignore')
 
-# --- Caching ---
-# Cache data fetching for performance. Cache for 1 hour.
-@st.cache_data(ttl=3600)
-def get_nifty50_tickers():
-    """
-    Fetches the list of Nifty50 tickers from Wikipedia.
-    Returns a list of Yahoo Finance compatible tickers (e.g., 'RELIANCE.NS').
-    """
-    try:
-        url = 'https://en.wikipedia.org/wiki/NIFTY_50'
-        # This will now work correctly after `pip install lxml`
-        tables = pd.read_html(url, attrs={'id': 'constituents'})
-        if not tables:
-            st.error("Could not find Nifty50 constituents table. Using a static list.")
-            return ['RELIANCE.NS', 'TCS.NS', 'HDFCBANK.NS', 'ICICIBANK.NS', 'INFY.NS']
+# Nifty 50 stocks with their Yahoo Finance symbols
+NIFTY50_SYMBOLS = {
+    'RELIANCE.NS': 'Reliance Industries',
+    'TCS.NS': 'Tata Consultancy Services',
+    'HDFCBANK.NS': 'HDFC Bank',
+    'INFY.NS': 'Infosys',
+    'HINDUNILVR.NS': 'Hindustan Unilever',
+    'ICICIBANK.NS': 'ICICI Bank',
+    'KOTAKBANK.NS': 'Kotak Mahindra Bank',
+    'BHARTIARTL.NS': 'Bharti Airtel',
+    'ITC.NS': 'ITC',
+    'LT.NS': 'Larsen & Toubro',
+    'SBIN.NS': 'State Bank of India',
+    'ASIANPAINT.NS': 'Asian Paints',
+    'HCLTECH.NS': 'HCL Technologies',
+    'AXISBANK.NS': 'Axis Bank',
+    'MARUTI.NS': 'Maruti Suzuki',
+    'SUNPHARMA.NS': 'Sun Pharmaceutical',
+    'TITAN.NS': 'Titan Company',
+    'ULTRACEMCO.NS': 'UltraTech Cement',
+    'WIPRO.NS': 'Wipro',
+    'NESTLEIND.NS': 'Nestle India',
+    'BAJFINANCE.NS': 'Bajaj Finance',
+    'ONGC.NS': 'ONGC',
+    'POWERGRID.NS': 'Power Grid Corporation',
+    'NTPC.NS': 'NTPC',
+    'M&M.NS': 'Mahindra & Mahindra',
+    'BAJAJFINSV.NS': 'Bajaj Finserv',
+    'ADANIPORTS.NS': 'Adani Ports',
+    'TECHM.NS': 'Tech Mahindra',
+    'BRITANNIA.NS': 'Britannia Industries',
+    'HDFC.NS': 'HDFC',
+    'DRREDDY.NS': 'Dr. Reddy\'s Laboratories',
+    'CIPLA.NS': 'Cipla',
+    'GRASIM.NS': 'Grasim Industries',
+    'COALINDIA.NS': 'Coal India',
+    'JSWSTEEL.NS': 'JSW Steel',
+    'TATAMOTORS.NS': 'Tata Motors',
+    'SBILIFE.NS': 'SBI Life Insurance',
+    'HINDALCO.NS': 'Hindalco Industries',
+    'UPL.NS': 'UPL',
+    'BAJAJ-AUTO.NS': 'Bajaj Auto',
+    'INDUSINDBK.NS': 'IndusInd Bank',
+    'TATASTEEL.NS': 'Tata Steel',
+    'DIVISLAB.NS': 'Divis Laboratories',
+    'HEROMOTOCO.NS': 'Hero MotoCorp',
+    'SHREECEM.NS': 'Shree Cement',
+    'APOLLOHOSP.NS': 'Apollo Hospitals',
+    'EICHERMOT.NS': 'Eicher Motors',
+    'BPCL.NS': 'BPCL',
+    'ADANIENT.NS': 'Adani Enterprises'
+}
+
+class EnhancedTradingStrategy:
+    def __init__(self):
+        self.commission_rate = 0.001  # 0.1% per trade
+        self.slippage = 0.0005  # 0.05% slippage
         
-        df = tables[0]
-        tickers = df['Symbol'].tolist()
-        return [t + ".NS" for t in tickers]
-    except Exception as e:
-        st.error(f"Error fetching Nifty50 tickers: {e}. Using a static list.")
-        return ['RELIANCE.NS', 'TCS.NS', 'HDFCBANK.NS', 'ICICIBANK.NS', 'INFY.NS']
-
-@st.cache_data(ttl=3600)
-def fetch_data(ticker: str, start_date: str, end_date: str, timeframe: str) -> pd.DataFrame:
-    """
-    Fetches OHLCV data from Yahoo Finance.
-    Flattens columns for compatibility with backtesting.py.
-    """
-    # yfinance timeframe mapping
-    tf_map = {
-        "15m": "15m",
-        "1H": "60m",
-        "1D": "1d"
-    }
-    
-    # yfinance intraday data is limited (max 730 days)
-    if timeframe in ["15m", "1H"]:
-        start_dt = pd.to_datetime(start_date)
-        if (pd.to_datetime(end_date) - start_dt).days > 720:
-            start_date = (pd.to_datetime(end_date) - timedelta(days=720)).strftime('%Y-%m-%d')
-            st.sidebar.warning(f"Intraday data limited to 720 days. Start date adjusted to {start_date}.")
-
-    data = yf.download(ticker, start=start_date, end=end_date, interval=tf_map[timeframe])
-    
-    if data.empty:
-        return pd.DataFrame()
-    
-    # --- START OF FIX ---
-    # Handle yfinance's potential MultiIndex columns (e.g., [('Open', ''), ('High', '')])
-    # This flattens the index to a simple list: ['Open', 'High', ...]
-    if isinstance(data.columns, pd.MultiIndex):
-        data.columns = data.columns.get_level_values(0)
-    
-    # Explicitly ensure column names are exactly what backtesting.py expects.
-    # yfinance usually returns capitalized, but this is a robust safeguard.
-    data.rename(columns={
-        'open': 'Open',
-        'high': 'High',
-        'low': 'Low',
-        'close': 'Close',
-        'volume': 'Volume',
-        'Open': 'Open',
-        'High': 'High',
-        'Low': 'Low',
-        'Close': 'Close',
-        'Volume': 'Volume'
-    }, inplace=True)
-    # --- END OF FIX ---
-    
-    # Ensure datetime index is timezone-naive for backtesting.py
-    if data.index.tz is not None:
-        data.index = data.index.tz_localize(None)
+    def calculate_advanced_indicators(self, data):
+        """Calculate comprehensive technical indicators"""
+        df = data.copy()
         
-    return data
-
-
-# --- Vectorized Indicator Functions ---
-# These functions will be wrapped by self.I() in the strategy
-# This is far more efficient than calculating in a loop.
-
-def calculate_cpr(high, low, close):
-    """Calculates Pivot, TC, and BC (Vectorized)"""
-    prev_high = high.shift(1)
-    prev_low = low.shift(1)
-    prev_close = close.shift(1)
+        # Moving Averages
+        df['sma_20'] = ta.trend.sma_indicator(df['close'], window=20)
+        df['sma_50'] = ta.trend.sma_indicator(df['close'], window=50)
+        df['sma_200'] = ta.trend.sma_indicator(df['close'], window=200)
+        df['ema_12'] = ta.trend.ema_indicator(df['close'], window=12)
+        df['ema_26'] = ta.trend.ema_indicator(df['close'], window=26)
+        
+        # RSI
+        df['rsi'] = ta.momentum.rsi(df['close'], window=14)
+        
+        # MACD
+        macd = ta.trend.MACD(df['close'])
+        df['macd'] = macd.macd()
+        df['macd_signal'] = macd.macd_signal()
+        df['macd_histogram'] = macd.macd_diff()
+        
+        # Bollinger Bands
+        bollinger = ta.volatility.BollingerBands(df['close'])
+        df['bb_upper'] = bollinger.bollinger_hband()
+        df['bb_lower'] = bollinger.bollinger_lband()
+        df['bb_middle'] = bollinger.bollinger_mavg()
+        
+        # Volume indicators
+        df['volume_sma'] = ta.trend.sma_indicator(df['volume'], window=20)
+        df['volume_ratio'] = df['volume'] / df['volume_sma']
+        
+        # ATR for volatility
+        df['atr'] = ta.volatility.average_true_range(df['high'], df['low'], df['close'])
+        
+        return df
     
-    pivot = (prev_high + prev_low + prev_close) / 3
-    bc = (prev_high + prev_low) / 2
-    tc = (pivot - bc) + pivot
-    return pivot, tc, bc
-
-def is_narrow_cpr(tc, bc, threshold=0.06):
-    """Checks for narrow CPR (Vectorized)"""
-    cpr_width = np.abs(tc - bc)
-    cpr_percentage = (cpr_width / bc) * 100
-    return cpr_percentage < threshold
-
-def is_near_sma(close, sma, threshold=0.15):
-    """Checks if price is near SMA (Vectorized)"""
-    diff_percentage = np.abs(close - sma) / sma * 100
-    return diff_percentage <= threshold
-
-def candle_signals(open_price, high_price, low_price, close_price):
-    """Calculates the specific candle patterns (Vectorized)"""
-    is_green_candle = close_price > open_price
-    is_red_candle = close_price < open_price
-
-    # Buy Signal Logic
-    prev1_red = is_red_candle.shift(1)
-    prev2_red = is_red_candle.shift(2)
-    break_prev1_high = high_price > high_price.shift(1)
-    break_prev2_high = high_price > high_price.shift(2)
-    buy_candle = is_green_candle & ((prev1_red & break_prev1_high) | (prev2_red & break_prev2_high))
+    def calculate_cpr(self, data):
+        """Calculate Central Pivot Range with enhanced logic"""
+        pivot = (data['high'].shift(1) + data['low'].shift(1) + data['close'].shift(1)) / 3
+        bc = (data['high'].shift(1) + data['low'].shift(1)) / 2
+        tc = (pivot - bc) + pivot
+        return pivot, tc, bc
     
-    # Sell Signal Logic
-    prev1_green = is_green_candle.shift(1)
-    prev2_green = is_green_candle.shift(2)
-    break_prev1_low = low_price < low_price.shift(1)
-    break_prev2_low = low_price < low_price.shift(2)
-    sell_candle = is_red_candle & ((prev1_green & break_prev1_low) | (prev2_green & break_prev2_low))
-
-    return buy_candle, sell_candle
-
-# --- The Strategy (using backtesting.py) ---
-
-class CprSmaStrategy(Strategy):
-    """
-    Implements the trading strategy within the backtesting.py framework.
-    Parameters are passed from the Streamlit UI.
-    """
-    # --- Strategy Parameters (will be set from UI) ---
-    sma_short_len = 20
-    sma_long_len = 200
-    cpr_threshold = 0.06
-    sma_threshold = 0.15
-    sma_lookback = 6
-    tp_pct = 0.002  # 0.2%
-    sl_pct = 0.001  # 0.1%
-    leverage_val = 10
-
-    def init(self):
-        """
-        Initialize the strategy.
-        Pre-calculate all indicators for maximum speed.
-        """
-        # --- SMA ---
-        self.sma_short = self.I(ta.sma, pd.Series(self.data.Close), length=self.sma_short_len)
-        self.sma_long = self.I(ta.sma, pd.Series(self.data.Close), length=self.sma_long_len)
+    def is_narrow_cpr(self, tc, bc, threshold=0.08):
+        """Enhanced CPR narrow condition"""
+        if pd.isna(tc) or pd.isna(bc) or bc == 0:
+            return False
+        cpr_width = abs(tc - bc)
+        cpr_percentage = (cpr_width / bc) * 100
+        return cpr_percentage < threshold
+    
+    def generate_signals(self, data):
+        """Generate enhanced trading signals"""
+        df = data.copy()
         
-        # --- CPR ---
-        self.pivot, self.tc, self.bc = self.I(
-            calculate_cpr, self.data.High, self.data.Low, self.data.Close
-        )
-        self.narrow_cpr = self.I(is_narrow_cpr, self.tc, self.bc, threshold=self.cpr_threshold)
+        # Initialize signal columns
+        df['signal'] = 0
+        df['signal_strength'] = 0.0
         
-        # --- Conditions ---
-        self.near_sma = self.I(is_near_sma, self.data.Close, self.sma_short, threshold=self.sma_threshold)
-        self.sma_rising = self.I(lambda x: x > x.shift(self.sma_lookback), self.sma_short)
-        self.sma_declining = self.I(lambda x: x < x.shift(self.sma_lookback), self.sma_short)
-        
-        # --- Candle Patterns ---
-        self.buy_candle, self.sell_candle = self.I(
-            candle_signals, self.data.Open, self.data.High, self.data.Low, self.data.Close
-        )
-
-    def next(self):
-        """
-        The main strategy logic, executed on each bar.
-        """
-        price = self.data.Close[-1]
-        
-        # --- Exit Logic ---
-        # backtesting.py handles exits automatically if 'sl' and 'tp' are set on the trade.
-        # We don't need manual exit logic.
-        
-        # --- Entry Logic ---
-        if not self.position:  # Only enter if we don't have a position
+        for i in range(200, len(df)):
+            current = df.iloc[i]
             
-            # --- Buy Signal ---
-            if (self.narrow_cpr[-1] and
-                self.near_sma[-1] and
-                self.sma_rising[-1] and
-                self.buy_candle[-1]):
-                
-                # Calculate SL and TP
-                sl = price * (1 - self.sl_pct)
-                tp = price * (1 + self.tp_pct)
-                
-                # Place buy order
-                self.buy(sl=sl, tp=tp, size=self.leverage_val)
-
-            # --- Sell Signal ---
-            elif (self.narrow_cpr[-1] and
-                  self.near_sma[-1] and
-                  self.sma_declining[-1] and
-                  self.sell_candle[-1]):
-                
-                # Calculate SL and TP
-                sl = price * (1 + self.sl_pct)
-                tp = price * (1 - self.tp_pct)
-                
-                # Place sell (short) order
-                self.sell(sl=sl, tp=tp, size=self.leverage_val)
-
-
-# --- Plotting Function ---
-
-def plot_backtest_chart(data: pd.DataFrame, stats: pd.Series, trades: pd.DataFrame):
-    """
-    Creates an interactive Plotly chart with OHLC, indicators, and trades.
-    """
-    fig = go.Figure()
-
-    # 1. OHLC Data
-    fig.add_trace(go.Ohlc(
-        x=data.index,
-        open=data['Open'],
-        high=data['High'],
-        low=data['Low'],
-        close=data['Close'],
-        name='Price'
-    ))
-
-    # 2. Indicators (from the strategy stats)
-    # We must access indicators via the _strategy object
-    if hasattr(stats, '_strategy') and stats._strategy:
-        indicators = stats._strategy.indicators
-        for indicator in indicators:
-            # Avoid plotting boolean arrays
-            if indicator.data.dtype == 'bool':
+            # Skip if missing data
+            if any(pd.isna([current['sma_20'], current['sma_50'], current['rsi'], 
+                           current['macd'], current['bb_upper']])):
                 continue
-            # Only plot key indicators
-            if indicator.name in ["sma_short", "sma_long", "pivot", "tc", "bc"]:
-                fig.add_trace(go.Scatter(
-                    x=data.index,
-                    y=indicator.data,
-                    name=indicator.name,
-                    line=dict(width=1, dash='dot' if "pivot" in indicator.name or "tc" in indicator.name or "bc" in indicator.name else 'solid')
-                ))
-
-    # 3. Trade Markers
-    if not trades.empty:
-        # Separate buys and sells
-        buys = trades[trades['Size'] > 0]
-        sells = trades[trades['Size'] < 0] # Covers both short entries and long exits
-
-        fig.add_trace(go.Scatter(
-            x=buys['EntryTime'],
-            y=buys['EntryPrice'],
-            mode='markers',
-            marker=dict(color='green', symbol='triangle-up', size=10),
-            name='Buy Entry'
-        ))
+            
+            # Bullish conditions
+            bullish_conditions = 0
+            total_conditions = 0
+            
+            # Price above key SMAs
+            if current['close'] > current['sma_20']:
+                bullish_conditions += 1
+            total_conditions += 1
+            
+            if current['close'] > current['sma_50']:
+                bullish_conditions += 1
+            total_conditions += 1
+            
+            # RSI not overbought
+            if current['rsi'] < 70:
+                bullish_conditions += 1
+            total_conditions += 1
+            
+            # MACD bullish
+            if current['macd'] > current['macd_signal']:
+                bullish_conditions += 1
+            total_conditions += 1
+            
+            # Volume confirmation
+            if current['volume_ratio'] > 1.0:
+                bullish_conditions += 1
+            total_conditions += 1
+            
+            # Calculate signal strength
+            signal_strength = bullish_conditions / total_conditions
+            
+            # Generate signals based on strength
+            if signal_strength >= 0.6 and current['narrow_cpr']:
+                if current['close'] > current['sma_20'] and current['macd_histogram'] > 0:
+                    df.loc[df.index[i], 'signal'] = 1
+                    df.loc[df.index[i], 'signal_strength'] = signal_strength
+                    
+            elif signal_strength <= 0.3 and current['narrow_cpr']:
+                if current['close'] < current['sma_20'] and current['macd_histogram'] < 0:
+                    df.loc[df.index[i], 'signal'] = -1
+                    df.loc[df.index[i], 'signal_strength'] = signal_strength
         
-        fig.add_trace(go.Scatter(
-            x=trades['ExitTime'],
-            y=trades['ExitPrice'],
-            mode='markers',
-            marker=dict(color='gray', symbol='x', size=8),
-            name='Trade Exit'
-        ))
+        return df
+    
+    def calculate_position_size(self, equity, price, risk_per_trade=0.02, stop_loss_pct=0.02):
+        """Calculate position size based on risk management"""
+        risk_amount = equity * risk_per_trade
+        stop_loss_amount = price * stop_loss_pct
+        position_size = risk_amount / stop_loss_amount if stop_loss_amount > 0 else 0
+        return min(position_size, equity * 0.1 / price)  # Max 10% per trade
+    
+    def run_backtest(self, data, initial_capital=100000, leverage=1):
+        """Enhanced backtest with professional risk management"""
+        df = data.copy()
         
-        fig.add_trace(go.Scatter(
-            x=sells['EntryTime'],
-            y=sells['EntryPrice'],
-            mode='markers',
-            marker=dict(color='red', symbol='triangle-down', size=10),
-            name='Sell Entry'
-        ))
+        # Calculate indicators
+        df = self.calculate_advanced_indicators(df)
+        df['pivot'], df['tc'], df['bc'] = self.calculate_cpr(df)
+        df['narrow_cpr'] = df.apply(lambda x: self.is_narrow_cpr(x['tc'], x['bc']), axis=1)
+        df = self.generate_signals(df)
+        
+        # Initialize tracking columns
+        df['position'] = 0
+        df['entry_price'] = np.nan
+        df['exit_price'] = np.nan
+        df['pnl'] = 0.0
+        df['cumulative_pnl'] = 0.0
+        df['equity'] = float(initial_capital)
+        df['drawdown'] = 0.0
+        df['position_size'] = 0
+        df['daily_return'] = 0.0
+        
+        position = 0
+        entry_price = 0
+        equity = initial_capital
+        peak_equity = initial_capital
+        total_trades = 0
+        winning_trades = 0
+        
+        for i in range(200, len(df)):
+            current = df.iloc[i]
+            
+            # Calculate daily return
+            if i > 200:
+                prev_equity = df.iloc[i-1]['equity']
+                df.loc[df.index[i], 'daily_return'] = (equity - prev_equity) / prev_equity * 100
+            
+            # Exit conditions
+            if position != 0:
+                if position == 1:  # Long position
+                    # Take profit at 2R (risk:reward 1:2)
+                    take_profit = entry_price * (1 + (entry_price * 0.02 * 2))
+                    stop_loss = entry_price * (1 - 0.02)  # 2% stop loss
+                    
+                    if current['high'] >= take_profit or current['low'] <= stop_loss:
+                        exit_price = take_profit if current['high'] >= take_profit else stop_loss
+                        pnl = (exit_price - entry_price) * position_size
+                        commission = entry_price * position_size * self.commission_rate * 2
+                        net_pnl = pnl - commission
+                        
+                        df.loc[df.index[i], 'exit_price'] = exit_price
+                        df.loc[df.index[i], 'pnl'] = net_pnl
+                        equity += net_pnl
+                        
+                        if net_pnl > 0:
+                            winning_trades += 1
+                        total_trades += 1
+                        
+                        position = 0
+                        entry_price = 0
+                
+                elif position == -1:  # Short position
+                    take_profit = entry_price * (1 - (entry_price * 0.02 * 2))
+                    stop_loss = entry_price * (1 + 0.02)
+                    
+                    if current['low'] <= take_profit or current['high'] >= stop_loss:
+                        exit_price = take_profit if current['low'] <= take_profit else stop_loss
+                        pnl = (entry_price - exit_price) * position_size
+                        commission = entry_price * position_size * self.commission_rate * 2
+                        net_pnl = pnl - commission
+                        
+                        df.loc[df.index[i], 'exit_price'] = exit_price
+                        df.loc[df.index[i], 'pnl'] = net_pnl
+                        equity += net_pnl
+                        
+                        if net_pnl > 0:
+                            winning_trades += 1
+                        total_trades += 1
+                        
+                        position = 0
+                        entry_price = 0
+            
+            # Entry conditions
+            if position == 0 and current['signal'] != 0:
+                position_size = self.calculate_position_size(equity, current['close'])
+                
+                if position_size > 0:
+                    if current['signal'] == 1:  # Buy signal
+                        position = 1
+                        entry_price = current['close'] * (1 + self.slippage)
+                        df.loc[df.index[i], 'position'] = 1
+                        df.loc[df.index[i], 'entry_price'] = entry_price
+                        df.loc[df.index[i], 'position_size'] = position_size
+                    
+                    elif current['signal'] == -1:  # Sell signal
+                        position = -1
+                        entry_price = current['close'] * (1 - self.slippage)
+                        df.loc[df.index[i], 'position'] = -1
+                        df.loc[df.index[i], 'entry_price'] = entry_price
+                        df.loc[df.index[i], 'position_size'] = position_size
+            
+            # Update equity and drawdown
+            df.loc[df.index[i], 'equity'] = equity
+            df.loc[df.index[i], 'cumulative_pnl'] = equity - initial_capital
+            
+            if equity > peak_equity:
+                peak_equity = equity
+            
+            current_drawdown = (peak_equity - equity) / peak_equity * 100
+            df.loc[df.index[i], 'drawdown'] = current_drawdown
+        
+        # Calculate performance metrics
+        performance = self.calculate_performance_metrics(df, initial_capital, total_trades, winning_trades)
+        
+        return df, performance
+    
+    def calculate_performance_metrics(self, df, initial_capital, total_trades, winning_trades):
+        """Calculate comprehensive performance metrics"""
+        final_equity = df['equity'].iloc[-1]
+        total_return = (final_equity - initial_capital) / initial_capital * 100
+        
+        # Sharpe Ratio (annualized)
+        daily_returns = df['daily_return'].dropna()
+        if len(daily_returns) > 0:
+            sharpe_ratio = (daily_returns.mean() / daily_returns.std()) * np.sqrt(252)
+        else:
+            sharpe_ratio = 0
+        
+        # Max Drawdown
+        max_drawdown = df['drawdown'].max()
+        
+        # Win rate
+        win_rate = (winning_trades / total_trades * 100) if total_trades > 0 else 0
+        
+        # Profit Factor
+        gross_profit = df[df['pnl'] > 0]['pnl'].sum()
+        gross_loss = abs(df[df['pnl'] < 0]['pnl'].sum())
+        profit_factor = gross_profit / gross_loss if gross_loss > 0 else float('inf')
+        
+        # CAGR
+        days = (df.index[-1] - df.index[0]).days
+        cagr = ((final_equity / initial_capital) ** (365/days) - 1) * 100 if days > 0 else 0
+        
+        return {
+            'total_return': total_return,
+            'cagr': cagr,
+            'sharpe_ratio': sharpe_ratio,
+            'max_drawdown': max_drawdown,
+            'win_rate': win_rate,
+            'total_trades': total_trades,
+            'profit_factor': profit_factor,
+            'final_equity': final_equity,
+            'gross_profit': gross_profit,
+            'gross_loss': gross_loss
+        }
 
-    fig.update_layout(
-        title=f"Backtest Results for {stats.get('Symbol', 'N/A')}",
-        xaxis_title="Date",
-        yaxis_title="Price",
-        legend_title="Legend",
-        xaxis_rangeslider_visible=False,
-        height=600,
-        template="plotly_dark"
+def fetch_market_data(symbol, period='2y', interval='1d'):
+    """Fetch real market data from Yahoo Finance"""
+    try:
+        ticker = yf.Ticker(symbol)
+        data = ticker.history(period=period, interval=interval)
+        
+        if data.empty:
+            st.error(f"No data found for {symbol}")
+            return None
+        
+        # Reset index and rename columns
+        data = data.reset_index()
+        data = data.rename(columns={'Date': 'timestamp', 'Open': 'open', 
+                                  'High': 'high', 'Low': 'low', 
+                                  'Close': 'close', 'Volume': 'volume'})
+        
+        # Ensure timestamp is datetime
+        data['timestamp'] = pd.to_datetime(data['timestamp'])
+        data = data.set_index('timestamp')
+        
+        return data
+    
+    except Exception as e:
+        st.error(f"Error fetching data for {symbol}: {str(e)}")
+        return None
+
+def create_dashboard():
+    """Create the main Streamlit dashboard"""
+    st.set_page_config(
+        page_title="Nifty50 Trading Strategy Dashboard",
+        page_icon="📈",
+        layout="wide",
+        initial_sidebar_state="expanded"
     )
-    return fig
+    
+    # Custom CSS
+    st.markdown("""
+    <style>
+    .main-header {
+        font-size: 2.5rem;
+        color: #1f77b4;
+        text-align: center;
+        margin-bottom: 2rem;
+    }
+    .metric-card {
+        background-color: #f0f2f6;
+        padding: 1rem;
+        border-radius: 10px;
+        margin: 0.5rem 0;
+    }
+    .positive { color: #00aa00; }
+    .negative { color: #ff0000; }
+    </style>
+    """, unsafe_allow_html=True)
+    
+    # Header
+    st.markdown('<h1 class="main-header">🏛️ Nifty50 Quantitative Trading Dashboard</h1>', unsafe_allow_html=True)
+    
+    # Sidebar
+    st.sidebar.title("Strategy Configuration")
+    
+    # Stock selection
+    selected_symbol = st.sidebar.selectbox(
+        "Select Stock",
+        options=list(NIFTY50_SYMBOLS.keys()),
+        format_func=lambda x: f"{NIFTY50_SYMBOLS[x]} ({x})"
+    )
+    
+    # Time period selection
+    col1, col2 = st.sidebar.columns(2)
+    with col1:
+        start_date = st.date_input("Start Date", datetime.now() - timedelta(days=365))
+    with col2:
+        end_date = st.date_input("End Date", datetime.now())
+    
+    # Timeframe selection
+    timeframe = st.sidebar.selectbox(
+        "Timeframe",
+        options=['1d', '1h', '4h', '1wk'],
+        index=0
+    )
+    
+    # Strategy parameters
+    st.sidebar.subheader("Risk Parameters")
+    initial_capital = st.sidebar.number_input("Initial Capital (₹)", value=100000, min_value=10000, step=10000)
+    risk_per_trade = st.sidebar.slider("Risk per Trade (%)", 0.5, 5.0, 2.0) / 100
+    cpr_threshold = st.sidebar.slider("CPR Narrow Threshold (%)", 0.01, 0.2, 0.08)
+    
+    # Main content
+    if st.sidebar.button("Run Backtest", type="primary"):
+        with st.spinner("Fetching market data and running backtest..."):
+            # Fetch data
+            period = '2y'  # Default period, will be filtered by dates
+            data = fetch_market_data(selected_symbol, period=period, interval=timeframe)
+            
+            if data is not None:
+                # Filter by selected date range
+                data = data[(data.index >= pd.Timestamp(start_date)) & (data.index <= pd.Timestamp(end_date))]
+                
+                if len(data) > 200:
+                    # Initialize and run strategy
+                    strategy = EnhancedTradingStrategy()
+                    strategy.is_narrow_cpr = lambda tc, bc: strategy.is_narrow_cpr(tc, bc, cpr_threshold)
+                    
+                    results, performance = strategy.run_backtest(
+                        data, 
+                        initial_capital=initial_capital,
+                        leverage=1
+                    )
+                    
+                    # Display results
+                    display_results(selected_symbol, results, performance, strategy)
+                else:
+                    st.error("Insufficient data for selected period. Please choose a longer time period.")
+            else:
+                st.error("Failed to fetch market data. Please try again.")
 
+def display_results(symbol, results, performance, strategy):
+    """Display comprehensive backtest results"""
+    
+    st.header(f"Backtest Results: {NIFTY50_SYMBOLS[symbol]} ({symbol})")
+    
+    # Key metrics
+    col1, col2, col3, col4 = st.columns(4)
+    
+    with col1:
+        st.metric(
+            "Total Return", 
+            f"₹{performance['final_equity']:,.0f}",
+            f"{performance['total_return']:.2f}%"
+        )
+    
+    with col2:
+        st.metric(
+            "CAGR",
+            f"{performance['cagr']:.2f}%"
+        )
+    
+    with col3:
+        st.metric(
+            "Sharpe Ratio",
+            f"{performance['sharpe_ratio']:.2f}"
+        )
+    
+    with col4:
+        st.metric(
+            "Max Drawdown",
+            f"{performance['max_drawdown']:.2f}%"
+        )
+    
+    # Additional metrics
+    col5, col6, col7, col8 = st.columns(4)
+    
+    with col5:
+        st.metric(
+            "Win Rate",
+            f"{performance['win_rate']:.1f}%"
+        )
+    
+    with col6:
+        st.metric(
+            "Total Trades",
+            f"{performance['total_trades']}"
+        )
+    
+    with col7:
+        st.metric(
+            "Profit Factor",
+            f"{performance['profit_factor']:.2f}"
+        )
+    
+    with col8:
+        color = "positive" if performance['gross_profit'] > performance['gross_loss'] else "negative"
+        st.markdown(f"<div class='metric-card'>Gross P/L: <span class='{color}'>₹{performance['gross_profit']:,.0f}/₹{performance['gross_loss']:,.0f}</span></div>", unsafe_allow_html=True)
+    
+    # Charts
+    create_interactive_charts(results, performance)
+    
+    # Trade analysis
+    st.subheader("Trade Analysis")
+    display_trade_analysis(results)
+    
+    # Download results
+    csv = convert_df_to_csv(results)
+    st.download_button(
+        label="Download Backtest Results",
+        data=csv,
+        file_name=f"backtest_results_{symbol}_{datetime.now().strftime('%Y%m%d')}.csv",
+        mime="text/csv"
+    )
 
-# --- Streamlit UI ---
+def create_interactive_charts(results, performance):
+    """Create interactive Plotly charts"""
+    
+    # Create subplots
+    fig = make_subplots(
+        rows=3, cols=2,
+        subplot_titles=(
+            'Price with Trading Signals', 
+            'Equity Curve',
+            'Indicator: RSI',
+            'Indicator: MACD',
+            'Drawdown',
+            'Daily Returns Distribution'
+        ),
+        vertical_spacing=0.08,
+        horizontal_spacing=0.08,
+        specs=[
+            [{"secondary_y": False}, {"secondary_y": False}],
+            [{"secondary_y": False}, {"secondary_y": False}],
+            [{"secondary_y": False}, {"secondary_y": False}]
+        ]
+    )
+    
+    # 1. Price with signals
+    fig.add_trace(
+        go.Scatter(x=results.index, y=results['close'], name='Price', line=dict(color='blue')),
+        row=1, col=1
+    )
+    
+    # Add buy signals
+    buy_signals = results[results['signal'] == 1]
+    fig.add_trace(
+        go.Scatter(x=buy_signals.index, y=buy_signals['close'], 
+                  mode='markers', name='Buy', marker=dict(color='green', size=8, symbol='triangle-up')),
+        row=1, col=1
+    )
+    
+    # Add sell signals
+    sell_signals = results[results['signal'] == -1]
+    fig.add_trace(
+        go.Scatter(x=sell_signals.index, y=sell_signals['close'], 
+                  mode='markers', name='Sell', marker=dict(color='red', size=8, symbol='triangle-down')),
+        row=1, col=1
+    )
+    
+    # 2. Equity curve
+    fig.add_trace(
+        go.Scatter(x=results.index, y=results['equity'], name='Equity', line=dict(color='green')),
+        row=1, col=2
+    )
+    
+    # 3. RSI
+    fig.add_trace(
+        go.Scatter(x=results.index, y=results['rsi'], name='RSI', line=dict(color='purple')),
+        row=2, col=1
+    )
+    fig.add_hline(y=70, line_dash="dash", line_color="red", row=2, col=1)
+    fig.add_hline(y=30, line_dash="dash", line_color="green", row=2, col=1)
+    
+    # 4. MACD
+    fig.add_trace(
+        go.Scatter(x=results.index, y=results['macd'], name='MACD', line=dict(color='blue')),
+        row=2, col=2
+    )
+    fig.add_trace(
+        go.Scatter(x=results.index, y=results['macd_signal'], name='Signal', line=dict(color='red')),
+        row=2, col=2
+    )
+    
+    # 5. Drawdown
+    fig.add_trace(
+        go.Scatter(x=results.index, y=results['drawdown'], name='Drawdown', 
+                  fill='tozeroy', line=dict(color='red')),
+        row=3, col=1
+    )
+    
+    # 6. Daily returns distribution
+    daily_returns = results['daily_return'].dropna()
+    fig.add_trace(
+        go.Histogram(x=daily_returns, name='Returns Distribution', nbinsx=50),
+        row=3, col=2
+    )
+    
+    fig.update_layout(height=1200, showlegend=True, title_text="Comprehensive Strategy Analysis")
+    st.plotly_chart(fig, use_container_width=True)
+
+def display_trade_analysis(results):
+    """Display detailed trade analysis"""
+    
+    trades = results[(results['signal'] != 0) | (results['pnl'] != 0)].copy()
+    
+    if len(trades) > 0:
+        # Create trade log
+        trade_log = []
+        current_trade = None
+        
+        for i, row in trades.iterrows():
+            if row['signal'] != 0 and current_trade is None:
+                current_trade = {
+                    'entry_date': i,
+                    'entry_price': row['entry_price'],
+                    'position': 'Long' if row['signal'] == 1 else 'Short',
+                    'signal_strength': row.get('signal_strength', 0)
+                }
+            elif row['pnl'] != 0 and current_trade is not None:
+                current_trade.update({
+                    'exit_date': i,
+                    'exit_price': row['exit_price'],
+                    'pnl': row['pnl'],
+                    'holding_period': (i - current_trade['entry_date']).days
+                })
+                trade_log.append(current_trade)
+                current_trade = None
+        
+        if trade_log:
+            trade_df = pd.DataFrame(trade_log)
+            st.dataframe(trade_df.style.format({
+                'entry_price': '{:.2f}',
+                'exit_price': '{:.2f}',
+                'pnl': '₹{:,.2f}',
+                'signal_strength': '{:.2f}'
+            }))
+
+def convert_df_to_csv(df):
+    """Convert DataFrame to CSV for download"""
+    return df.to_csv().encode('utf-8')
 
 def main():
-    """Defines the Streamlit application UI."""
-    
-    st.title("📈 Nifty50 Quantitative Strategy Backtester")
-    st.markdown("Test the **Narrow CPR & SMA Crossover** strategy on Nifty50 stocks.")
-
-    # --- Sidebar for Inputs ---
-    with st.sidebar:
-        st.header("🛠️ Configuration")
-        
-        # --- Stock and Timeframe ---
-        nifty_tickers = get_nifty50_tickers()
-        default_index = 0
-        if "RELIANCE.NS" in nifty_tickers:
-            default_index = nifty_tickers.index("RELIANCE.NS")
-        
-        symbol = st.selectbox("Select Stock", options=nifty_tickers, index=default_index)
-        
-        timeframe = st.selectbox("Select Timeframe", options=["1D", "1H", "15m"], index=0)
-        
-        col1, col2 = st.columns(2)
-        with col1:
-            start_date = st.date_input("Start Date", datetime.now() - timedelta(days=3 * 365))
-        with col2:
-            end_date = st.date_input("End Date", datetime.now())
-
-        # --- Strategy Parameters ---
-        st.subheader("Strategy Parameters")
-        
-        with st.expander("Indicator Settings"):
-            sma_short_len = st.number_input("Short SMA Period", min_value=1, max_value=100, value=20)
-            sma_long_len = st.number_input("Long SMA Period", min_value=50, max_value=500, value=200)
-            sma_lookback = st.number_input("SMA Direction Lookback", min_value=1, max_value=20, value=6)
-            cpr_threshold = st.slider("Narrow CPR Threshold (%)", 0.01, 1.0, 0.06, 0.01)
-            sma_threshold = st.slider("SMA Proximity Threshold (%)", 0.01, 5.0, 0.15, 0.01)
-
-        with st.expander("Trade & Risk Settings"):
-            leverage = st.number_input("Leverage", min_value=1, max_value=20, value=10)
-            tp_pct_ui = st.number_input("Take Profit (%)", min_value=0.1, max_value=5.0, value=0.2, step=0.1)
-            sl_pct_ui = st.number_input("Stop Loss (%)", min_value=0.1, max_value=5.0, value=0.1, step=0.1)
-            commission = st.number_input("Commission (% per trade)", min_value=0.0, max_value=1.0, value=0.1, step=0.01)
-            initial_cash = st.number_input("Initial Cash", min_value=1000, value=100_000, step=1000)
-
-        # --- Run Button ---
-        run_button = st.button("Run Backtest", use_container_width=True, type="primary")
-
-    # --- Main Panel for Results ---
-    if run_button:
-        with st.spinner(f"Fetching {symbol} data and running backtest..."):
-            # 1. Fetch Data
-            data = fetch_data(symbol, start_date.strftime('%Y-%m-%d'), end_date.strftime('%Y-%m-%d'), timeframe)
-            
-            if data.empty:
-                st.error(f"No data found for {symbol}. Please try a different stock or date range.")
-                return
-
-            # 2. Configure Strategy
-            # Update the strategy class with UI parameters
-            CprSmaStrategy.sma_short_len = sma_short_len
-            CprSmaStrategy.sma_long_len = sma_long_len
-            CprSmaStrategy.cpr_threshold = cpr_threshold
-            CprSmaStrategy.sma_threshold = sma_threshold
-            CprSmaStrategy.sma_lookback = sma_lookback
-            CprSmaStrategy.tp_pct = tp_pct_ui / 100.0
-            CprSmaStrategy.sl_pct = sl_pct_ui / 100.0
-            CprSmaStrategy.leverage_val = leverage
-
-            # 3. Run Backtest
-            bt = Backtest(
-                data,
-                CprSmaStrategy,
-                cash=initial_cash,
-                commission=commission / 100.0,  # Convert % to decimal
-                exclusive_orders=True
-            )
-            
-            try:
-                stats = bt.run()
-                stats['Symbol'] = symbol # Add symbol for plotting
-                trades = stats._trades
-            except Exception as e:
-                st.error(f"An error occurred during backtest: {e}")
-                st.info("This can happen if there is not enough data for the indicators (e.g., SMA 200). Try a longer date range.")
-                return
-
-        st.success("Backtest complete!")
-
-        # 4. Display Results
-        st.header("Backtest Results")
-        
-        # --- Key Metrics ---
-        st.subheader("Key Performance Indicators (KPIs)")
-        
-        # Add a check for 'Return (Ann.) [%]' which may not exist for short periods
-        return_metric = stats.get('Return [%]', 0.0)
-        
-        kpi_cols = st.columns(6)
-        kpi_cols[0].metric("Return [%]", f"{return_metric:.2f}")
-        kpi_cols[1].metric("Win Rate [%]", f"{stats.get('Win Rate [%]', 0.0):.2f}")
-        kpi_cols[2].metric("# of Trades", f"{stats.get('# Trades', 0)}")
-        kpi_cols[3].metric("Profit Factor", f"{stats.get('Profit Factor', 0.0):.2f}")
-        kpi_cols[4].metric("Max Drawdown [%]", f"{stats.get('Max. Drawdown [%]', 0.0):.2f}")
-        kpi_cols[5].metric("Sharpe Ratio", f"{stats.get('Sharpe Ratio', 0.0):.2f}")
-
-        # --- Tabs for Charts and Logs ---
-        tab1, tab2, tab3 = st.tabs(["📈 Interactive Chart", "📋 Trade Log", "📊 Full Statistics"])
-
-        with tab1:
-            st.subheader("Equity Curve & Trades")
-            # Generate and display the interactive chart
-            fig = plot_backtest_chart(data, stats, trades)
-            st.plotly_chart(fig, use_container_width=True)
-
-        with tab2:
-            st.subheader("Trade Log")
-            st.dataframe(trades, use_container_width=True)
-
-        with tab3:
-            st.subheader("Full Backtest Statistics")
-            st.dataframe(pd.Series(stats).to_frame('Value'), use_container_width=True)
-
-    else:
-        st.info("Please select your parameters in the sidebar and click **Run Backtest**.")
+    """Main application"""
+    create_dashboard()
 
 if __name__ == "__main__":
     main()
