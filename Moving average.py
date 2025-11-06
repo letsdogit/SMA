@@ -1,74 +1,143 @@
-def run_strategy(df, leverage=10, commission_rate=0.001):
-    df = df.copy().reset_index()
-    df.rename(columns={"Date": "timestamp"}, inplace=True)
+# ===================== Data Fetch =====================
 
-    df["sma_20"] = calculate_sma(df, 20)
-    df["sma_200"] = calculate_sma(df, 200)
+@st.cache_data(ttl=3600)
+def fetch_yahoo_daily(ticker: str, period: str = "2y") -> pd.DataFrame:
+    df = yf.download(ticker, period=period, interval="1d", progress=False)
+    # Keep standard columns; Date index stays (run_strategy handles reset)
+    return df[["Open", "High", "Low", "Close", "Volume"]].copy()
 
-    df["pivot"], df["tc"], df["bc"] = calculate_cpr_daily(df)
 
-    cpr_width = abs(df["tc"] - df["bc"])
-    cpr_pct = cpr_width / df["bc"].replace(0, np.nan) * 100
-    df["narrow_cpr"] = (cpr_pct < 0.06).fillna(False)
+# ===================== Nifty50 (editable subset) =====================
 
-    df["signal"] = 0
-    df["entry_price"] = np.nan
-    df["exit_price"] = np.nan
-    df["pnl"] = 0.0
-    df["position"] = ""
-    df["equity"] = 10000.0
-    df["drawdown"] = 0.0
+NIFTY50 = {
+    "Reliance Industries": "RELIANCE.NS",
+    "Tata Consultancy Services": "TCS.NS",
+    "Infosys": "INFY.NS",
+    "HDFC Bank": "HDFCBANK.NS",
+    "ICICI Bank": "ICICIBANK.NS",
+    "Kotak Mahindra Bank": "KOTAKBANK.NS",
+    "Hindustan Unilever": "HINDUNILVR.NS",
+    "State Bank of India": "SBIN.NS",
+    "ITC": "ITC.NS",
+    "Larsen & Toubro": "LT.NS",
+    "Bajaj Finance": "BAJFINANCE.NS",
+    "Axis Bank": "AXISBANK.NS",
+    "Oil & Natural Gas": "ONGC.NS",
+    "Bharat Petroleum": "BPCL.NS",
+    "Mahindra & Mahindra": "M&M.NS",
+    "Asian Paints": "ASIANPAINT.NS",
+    "Titan Company": "TITAN.NS",
+    "Sun Pharmaceutical": "SUNPHARMA.NS",
+    "Maruti Suzuki": "MARUTI.NS",
+}
 
-    position = None
-    entry_price = 0
-    equity = 10000
 
-    for i in range(200, len(df)):  # ensure SMA200 exists
-        current = df.iloc[i]
+# ===================== Streamlit App =====================
 
-        # Exit existing trades
-        if position == "long":
-            tp = entry_price * 1.002
-            sl = entry_price * 0.999
-            if current["High"] >= tp or current["Low"] <= sl:
-                exit_px = tp if current["High"] >= tp else sl
-                df.loc[i, "exit_price"] = exit_px
-                pct = (exit_px - entry_price) / entry_price * 100
-                df.loc[i, "pnl"] = pct * leverage - (2 * commission_rate * 100)
-                equity *= (1 + df.loc[i, "pnl"] / 100)
-                df.loc[i, "position"] = "exit_long"
-                position = None
+st.title("Nifty50 Backtest Dashboard — Daily CPR")
+st.caption(
+    "Uses Yahoo Finance (yfinance). CPR is computed from the **previous day** OHLC. "
+    "Reliance is included by default. No intraday CPR in this version."
+)
 
-        elif position == "short":
-            tp = entry_price * 0.998
-            sl = entry_price * 1.001
-            if current["Low"] <= tp or current["High"] >= sl:
-                exit_px = tp if current["Low"] <= tp else sl
-                df.loc[i, "exit_price"] = exit_px
-                pct = (entry_price - exit_px) / entry_price * 100
-                df.loc[i, "pnl"] = pct * leverage - (2 * commission_rate * 100)
-                equity *= (1 + df.loc[i, "pnl"] / 100)
-                df.loc[i, "position"] = "exit_short"
-                position = None
+with st.sidebar:
+    st.header("Parameters")
+    ticker_name = st.selectbox("Pick a Nifty50 stock", options=list(NIFTY50.keys()), index=0)
+    ticker = NIFTY50[ticker_name]
+    period = st.selectbox("History period", options=["6mo", "1y", "2y", "5y", "10y", "max"], index=2)
+    leverage = st.number_input("Leverage (x)", min_value=1, max_value=50, value=10)
+    commission = st.number_input(
+        "Commission per side (decimal)", min_value=0.0, max_value=0.01, value=0.001, step=0.0005
+    )
+    run_btn = st.button("Run Backtest", use_container_width=True)
 
-        df.loc[i, "equity"] = equity
-        peak = df["equity"][:i+1].max()
-        df.loc[i, "drawdown"] = (equity - peak) / peak * 100 if peak != 0 else 0
+# Quick action button
+if st.button("Run Reliance sample (2y daily)"):
+    ticker_name = "Reliance Industries"
+    ticker = NIFTY50[ticker_name]
+    period = "2y"
+    leverage = 10
+    commission = 0.001
+    run_btn = True
 
-        narrow_flag = df["narrow_cpr"].iloc[i] == True
+if run_btn:
+    with st.spinner(f"Fetching {ticker_name} ({ticker}) daily data and running backtest..."):
+        df = fetch_yahoo_daily(ticker, period=period)
+        if df.empty or len(df) < 220:  # enough bars for SMA200
+            st.error("Not enough data fetched. Try a longer period or verify ticker.")
+        else:
+            result = run_strategy(df, leverage=leverage, commission_rate=commission)
 
-        if position is None and narrow_flag and is_near_sma(current["Close"], current["sma_20"]):
-            if i >= 6 and df["sma_20"].iloc[i] > df["sma_20"].iloc[i-6] and check_buy_signal(df, i):
-                df.loc[i, "signal"] = 1
-                df.loc[i, "entry_price"] = current["Close"]
-                df.loc[i, "position"] = "long"
-                position = "long"
-                entry_price = current["Close"]
-            elif i >= 6 and df["sma_20"].iloc[i] < df["sma_20"].iloc[i-6] and check_sell_signal(df, i):
-                df.loc[i, "signal"] = -1
-                df.loc[i, "entry_price"] = current["Close"]
-                df.loc[i, "position"] = "short"
-                position = "short"
-                entry_price = current["Close"]
+            # -------- Summary --------
+            total_trades = int((result["signal"] != 0).sum())
+            winning_trades = int((result["pnl"] > 0).sum())
+            losing_trades = int((result["pnl"] < 0).sum())
+            total_pnl = float(result["pnl"].sum())
+            final_equity = float(result["equity"].iloc[-1])
+            roi = ((final_equity - 10000) / 10000) * 100
+            max_drawdown = float(result["drawdown"].min())
+            win_rate = (winning_trades / total_trades * 100) if total_trades > 0 else 0.0
 
-    return df
+            st.subheader(f"Backtest — {ticker_name} ({ticker})")
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("Final Equity", f"${final_equity:,.2f}", delta=f"{roi:.2f}%")
+            m2.metric("Total Trades", total_trades)
+            m3.metric("Win Rate", f"{win_rate:.2f}%")
+            m4.metric("Max Drawdown", f"{max_drawdown:.2f}%")
+
+            # -------- Charts --------
+            fig = plt.figure(figsize=(14, 8))
+
+            ax = fig.add_subplot(2, 1, 1)
+            ax.plot(result["timestamp"], result["Close"], label="Close", linewidth=1)
+            ax.plot(result["timestamp"], result["sma_20"], label="SMA 20")
+            ax.plot(result["timestamp"], result["sma_200"], label="SMA 200")
+
+            buys = result[result["signal"] == 1]
+            sells = result[result["signal"] == -1]
+            ax.scatter(buys["timestamp"], buys["Close"], marker="^", s=70, label="Buy")
+            ax.scatter(sells["timestamp"], sells["Close"], marker="v", s=70, label="Sell")
+
+            ax.set_title("Price with SMAs and Signals (Daily)")
+            ax.legend()
+            ax.grid(True, alpha=0.3)
+
+            ax2 = fig.add_subplot(2, 1, 2)
+            ax2.plot(result["timestamp"], result["equity"], linewidth=2)
+            ax2.axhline(y=10000, linestyle="--", linewidth=0.8)
+            ax2.set_title("Equity Curve")
+            ax2.grid(True, alpha=0.3)
+
+            st.pyplot(fig)
+
+            # -------- Trade logs --------
+            entries = result[result["signal"] != 0][
+                ["timestamp", "signal", "entry_price", "position", "sma_20"]
+            ]
+            exits = result[result["pnl"] != 0][["timestamp", "exit_price", "pnl", "position"]]
+            st.subheader("Trade Log")
+            if not entries.empty:
+                c1, c2 = st.columns(2)
+                with c1:
+                    st.write("Entries")
+                    st.dataframe(entries.reset_index(drop=True))
+                with c2:
+                    st.write("Exits / PnL")
+                    st.dataframe(exits.reset_index(drop=True))
+            else:
+                st.info("No trades executed during this backtest period.")
+
+            # -------- Download --------
+            csv = result.to_csv(index=False).encode("utf-8")
+            st.download_button(
+                "Download full backtest CSV",
+                data=csv,
+                file_name=f"backtest_{ticker}.csv",
+                mime="text/csv",
+            )
+
+st.markdown("---")
+st.write("Notes:")
+st.write("- CPR is computed only on **daily** data using the *previous day* OHLC.")
+st.write("- Commission is per side (entry and exit both charged).")
+st.write("- Want intraday CPR mapping (15m/1h) or Plotly charts? I can add that next.")
