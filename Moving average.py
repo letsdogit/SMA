@@ -26,6 +26,7 @@ def get_nifty50_tickers():
     """
     try:
         url = 'https://en.wikipedia.org/wiki/NIFTY_50'
+        # This will now work correctly after `pip install lxml`
         tables = pd.read_html(url, attrs={'id': 'constituents'})
         if not tables:
             st.error("Could not find Nifty50 constituents table. Using a static list.")
@@ -42,7 +43,7 @@ def get_nifty50_tickers():
 def fetch_data(ticker: str, start_date: str, end_date: str, timeframe: str) -> pd.DataFrame:
     """
     Fetches OHLCV data from Yahoo Finance.
-    Renames columns for compatibility with backtesting.py.
+    Flattens columns for compatibility with backtesting.py.
     """
     # yfinance timeframe mapping
     tf_map = {
@@ -63,14 +64,27 @@ def fetch_data(ticker: str, start_date: str, end_date: str, timeframe: str) -> p
     if data.empty:
         return pd.DataFrame()
     
-    # Rename for backtesting.py compatibility
+    # --- START OF FIX ---
+    # Handle yfinance's potential MultiIndex columns (e.g., [('Open', ''), ('High', '')])
+    # This flattens the index to a simple list: ['Open', 'High', ...]
+    if isinstance(data.columns, pd.MultiIndex):
+        data.columns = data.columns.get_level_values(0)
+    
+    # Explicitly ensure column names are exactly what backtesting.py expects.
+    # yfinance usually returns capitalized, but this is a robust safeguard.
     data.rename(columns={
+        'open': 'Open',
+        'high': 'High',
+        'low': 'Low',
+        'close': 'Close',
+        'volume': 'Volume',
         'Open': 'Open',
         'High': 'High',
         'Low': 'Low',
         'Close': 'Close',
         'Volume': 'Volume'
     }, inplace=True)
+    # --- END OF FIX ---
     
     # Ensure datetime index is timezone-naive for backtesting.py
     if data.index.tz is not None:
@@ -227,19 +241,21 @@ def plot_backtest_chart(data: pd.DataFrame, stats: pd.Series, trades: pd.DataFra
     ))
 
     # 2. Indicators (from the strategy stats)
-    indicators = stats._strategy.indicators
-    for indicator in indicators:
-        # Avoid plotting boolean arrays
-        if indicator.data.dtype == 'bool':
-            continue
-        # Only plot key indicators
-        if indicator.name in ["sma_short", "sma_long", "pivot", "tc", "bc"]:
-            fig.add_trace(go.Scatter(
-                x=data.index,
-                y=indicator.data,
-                name=indicator.name,
-                line=dict(width=1, dash='dot' if "cpr" in indicator.name else 'solid')
-            ))
+    # We must access indicators via the _strategy object
+    if hasattr(stats, '_strategy') and stats._strategy:
+        indicators = stats._strategy.indicators
+        for indicator in indicators:
+            # Avoid plotting boolean arrays
+            if indicator.data.dtype == 'bool':
+                continue
+            # Only plot key indicators
+            if indicator.name in ["sma_short", "sma_long", "pivot", "tc", "bc"]:
+                fig.add_trace(go.Scatter(
+                    x=data.index,
+                    y=indicator.data,
+                    name=indicator.name,
+                    line=dict(width=1, dash='dot' if "pivot" in indicator.name or "tc" in indicator.name or "bc" in indicator.name else 'solid')
+                ))
 
     # 3. Trade Markers
     if not trades.empty:
@@ -272,7 +288,7 @@ def plot_backtest_chart(data: pd.DataFrame, stats: pd.Series, trades: pd.DataFra
         ))
 
     fig.update_layout(
-        title=f"Backtest Results for {stats['Symbol']}",
+        title=f"Backtest Results for {stats.get('Symbol', 'N/A')}",
         xaxis_title="Date",
         yaxis_title="Price",
         legend_title="Legend",
@@ -297,7 +313,11 @@ def main():
         
         # --- Stock and Timeframe ---
         nifty_tickers = get_nifty50_tickers()
-        symbol = st.selectbox("Select Stock", options=nifty_tickers, index=nifty_tickers.index("RELIANCE.NS"))
+        default_index = 0
+        if "RELIANCE.NS" in nifty_tickers:
+            default_index = nifty_tickers.index("RELIANCE.NS")
+        
+        symbol = st.selectbox("Select Stock", options=nifty_tickers, index=default_index)
         
         timeframe = st.selectbox("Select Timeframe", options=["1D", "1H", "15m"], index=0)
         
