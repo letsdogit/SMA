@@ -1,8 +1,6 @@
 streamlit
+yfinance
 pandas
 numpy
-yfinance
-backtesting
-pandas-ta
-plotly
-lxml
+matplotlib
+ta
